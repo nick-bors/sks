@@ -1,0 +1,21 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-Wall",
+      "-Wextra",
+      "-pedantic",
+      "-O3",
+      "-g3",
+      "-fsanitize=address",
+      "-I.",
+      "-c",
+      "-o",
+      "src/main.o",
+      "src/main.c"
+    ],
+    "directory": "/home/nick/projects/sws",
+    "file": "/home/nick/projects/sws/src/main.c",
+    "output": "/home/nick/projects/sws/src/main.o"
+  }
+]

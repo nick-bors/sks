@@ -1,0 +1,4 @@
+skd
+*.o
+.cache/
+compile_commands.json
