@@ -7,14 +7,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <strings.h>
 #include <unistd.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
 #include <git2.h>
+
+#include "uri.h"
+#include "zbase32.h"
 
 #define BUFFER_SIZE 1024
 #define MAX_CERTS 10
@@ -27,10 +32,16 @@
 #define LEN(x)    (sizeof(x)/sizeof((x)[0]))
 #define MIN(a,b)  ((a) < (b) ? (a) : (b))
 
-void die(const char *, ...);
+void  die(const char *, ...);
 void *handle(void *);
-void get(int, char *);
-int main(int, char *[]);
+void  get(int, char *);
+int   main(int, char *[]);
+
+int skip_wellknown(const char *, const char *);
+
+void handle_hashed_user(int, Uri *, int);
+void handle_submission_address(int, const char *);
+void handle_policy(int);
 
 void *handle_authget   (int, char *);
 void *handle_get       (int, char *);
@@ -42,6 +53,7 @@ void *handle_index     (int, char *);
 void *handle_vindex    (int, char *);
 void *handle_stats     (int, char *);
 
+/*
 static struct {
 	const char *op; void* (*handler)(int, char *);
 } Handlers[] = {
@@ -55,6 +67,7 @@ static struct {
 	// {"vindex", handle_vindex},
 	// {"stats", handle_stats},
 };
+*/
 
 
 typedef struct {
@@ -62,7 +75,6 @@ typedef struct {
 } State;
 
 static State state;
-static pthread_mutex_t repo_write_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int main(int argc, char *argv[])
 {
@@ -141,29 +153,275 @@ void* handle(void *arg) {
 	return NULL;
 }
 
-void get(int clientfd, char *cursor) {
-	if(strncmp(cursor, "/pks/v2/", 8) == 0) {
-		cursor += 8;
-	} else if(strncmp(cursor, "/pks/lookup?op=", 15) == 0) {
-		cursor += 15;
+void bad_request(int clientfd) {
+	static const char reply[] = "HTTP/1.1 400 Bad Request\r\n"
+							    "Content-Length: 0\r\n"
+							    "\r\n";
+
+	send(clientfd, reply, sizeof(reply) - 1, 0);
+}
+
+void internal_server_error(int clientfd) {
+	char *reply = "HTTP/1.1 500 Internal Server Error\r\n"
+				  "Content-Length: 0\r\n"
+				  "\r\n";
+
+	send(clientfd, reply, strlen(reply), 0);
+}
+
+void not_found(int clientfd) {
+	char *reply = "HTTP/1.1 404 Not Found\r\n"
+				  "Content-Length: 0\r\n"
+				  "\r\n";
+
+	send(clientfd, reply, strlen(reply), 0);
+}
+
+int skip_wellknown(const char *resource, const char *domain) {
+    static const char prefix[]   = "/.well-known/openpgpkey/";
+	static const int  prefix_len = sizeof(prefix) - 1;
+
+	/* Simple:   /.well-known/openpgpkey/ */
+	if (strncmp(resource, prefix, prefix_len) != 0)
+		return -1;
+
+    const char *post = resource + prefix_len;
+	size_t domain_len = strlen(domain);
+
+	if (strncasecmp(domain, post, strlen(domain)) == 0
+		&& post[domain_len] == '/') {
+		post += domain_len + 1;	
 	}
 
-	size_t i;
+	return post - resource;
+}
 
-	for(i = 0; i < LEN(Handlers); i++) {
-		if (strncmp(Handlers[i].op, cursor, strlen(Handlers[i].op)) == 0) {
-			Handlers[i].handler(clientfd, cursor + strlen(Handlers[i].op) + 1);
+void get(int clientfd, char *cursor) {
+	char *rawuri = cursor;
+	cursor = strchr(cursor, ' ');
+	*cursor++ = '\0';
+
+	Uri *uri = malloc(sizeof(Uri));
+	int e = parse_uri(uri, rawuri);
+	if (e < 0) {
+		bad_request(clientfd);
+		return;
+	}
+
+	const char *domain = "example.com";
+
+	int offset = skip_wellknown(uri->resource, domain);
+	if (offset < 0) {
+		bad_request(clientfd);
+		return;
+	}
+
+	const char *suffix = uri->resource + offset;
+
+    static const char hu_suffix[]   = "hu/";
+	static const int  hu_suffix_len = sizeof(hu_suffix) - 1;
+
+    static const char policy_suffix[]   = "policy";
+	static const int  policy_suffix_len = sizeof(policy_suffix) - 1;
+
+    static const char sub_suffix[]   = "submission-address";
+	static const int  sub_suffix_len = sizeof(sub_suffix) - 1;
+
+	if (strncmp(suffix, hu_suffix, hu_suffix_len) == 0) {
+		handle_hashed_user(clientfd, uri, offset + hu_suffix_len);
+		return;
+	}
+
+	if (strncmp(suffix, policy_suffix, policy_suffix_len) == 0) {
+		handle_policy(clientfd);
+		return;
+	}
+
+	if (strncmp(suffix, sub_suffix, sub_suffix_len) == 0) {
+		handle_submission_address(clientfd, domain);
+		return;
+	}
+
+	not_found(clientfd);
+	return;
+}
+
+void handle_policy(int clientfd) {
+	char *reply = "HTTP/1.1 200 OK\r\n"
+				  "Content-Type: text/plain; charset=UTF-8\r\n"
+				  "Content-Length: 22\r\n"
+				  "\r\n"
+				  "protocol-version: 20\r\n";
+
+	send(clientfd, reply, strlen(reply), 0);
+}
+
+void handle_submission_address(int clientfd, const char *domain) {
+	static const char local[] = "openpgpkey@";
+	char *body = malloc(strlen(domain) + sizeof(local));
+
+
+	memcpy(body, local, sizeof(local));
+	strcat(body, domain);
+
+	if(strlen(body) > 256) {
+		bad_request(clientfd);
+		return;
+	}
+	// fixed header = 108
+	// max email length 256 hence Content-Length = 3
+	// null = 1
+	// total: 112
+	char *head = malloc(112);
+	
+	sprintf(head,
+		"HTTP/1.1 200 OK\r\n"
+		"Content-Type: text/plain; charset=utf-8\r\n"
+		"Content-Length: %zu\r\n"
+		"Cache-Control: max-age=86400\r\n"
+		"\r\n",
+		strlen(body));
+
+	send(clientfd, head, strlen(head), 0);
+	send(clientfd, body, strlen(body), 0);
+}
+
+void handle_hashed_user(int clientfd, Uri *uri, int offset) {
+	const char *hash = uri->resource + offset;
+	printf("hash is: %s\n", hash);
+	if (strlen(hash) != 32) {
+		printf("bad REQ, hashlen expected 32, got %zu\n", strlen(hash));
+		bad_request(clientfd);
+		return;
+	}
+
+	if(!is_zbase32_chars(hash)) {
+		printf("hash is not zbase32 alphabet\n");
+		bad_request(clientfd);
+		return;
+	}
+
+	git_repository *repo = state.repo;
+	git_oid oid;
+	git_commit *commit;
+	git_tree *tree = NULL;
+	git_tree_entry *tree_entry = NULL;
+	int err;
+
+	err = git_reference_name_to_id(&oid, repo, "HEAD");
+	if (err < 0) {
+		const git_error *e = git_error_last();
+		fprintf(stderr, "Couldn't get HEAD reference %d/%d: %s\n", err, e->klass, e->message);
+		internal_server_error(clientfd);
+		return;
+	}
+
+	err = git_commit_lookup(&commit, repo, &oid);
+	if (err < 0) {
+		const git_error *e = git_error_last();
+		fprintf(stderr, "Couldn't look up object id in git database %d/%d: %s\n", err, e->klass, e->message);
+		internal_server_error(clientfd);
+		return;
+	}
+
+	err = git_commit_tree(&tree, commit);
+	if (err < 0) {
+		const git_error *e = git_error_last();
+		fprintf(stderr, "Couldn't get tree for commit %d/%d: %s\n", err, e->klass, e->message);
+		internal_server_error(clientfd);
+		return;
+	}
+
+	// Split into directories by starting hash letter
+	char dirstr[2] = {hash[0], '\0'};
+
+	err = git_tree_entry_bypath(&tree_entry, tree, dirstr);
+	if (err < 0) {
+		const git_error *e = git_error_last();
+		fprintf(stderr, "Couldn't find \"%s/\" subdirectory %d/%d: %s\n", dirstr, err, e->klass, e->message);
+		not_found(clientfd);
+		return;
+	}
+
+	if (git_tree_entry_type(tree_entry) != GIT_OBJECT_TREE) {
+		const git_error *e = git_error_last();
+		fprintf(stderr, "Expected a directory \"%s/\", not a file %d/%d: %s\n", dirstr, err, e->klass, e->message);
+		internal_server_error(clientfd);
+		return;
+	}
+
+	git_tree *dir = NULL;
+	err = git_tree_lookup(&dir, repo, git_tree_entry_id(tree_entry));
+	if (err < 0) {
+		const git_error *e = git_error_last();
+		fprintf(stderr, "Couldn't look-up \"%s/\"tree %d/%d: %s\n", dirstr, err, e->klass, e->message);
+		internal_server_error(clientfd);
+		return;
+	}
+
+
+	char *header;
+	char *body;
+	size_t body_len = 0;
+
+	for (size_t i = 0; i < git_tree_entrycount(dir); i++) {
+		const git_tree_entry *e = git_tree_entry_byindex(dir, i);
+
+		if (!e)
+			continue;
+
+		const char *name = git_tree_entry_name(e);
+		const git_oid *oid = git_tree_entry_id(e);
+
+		printf("hash: %s\n", hash);
+		printf("curr: %s\n", name);
+		if (strncmp(hash, name, 32) == 0) {
+			printf("Matches! %s\n", name);
+
+			git_blob *blob;
+			err = git_blob_lookup(&blob, repo, oid);
+			if (err < 0) {
+				const git_error *e = git_error_last();
+				fprintf(stderr, "Couldn't read blob %s %d/%d: %s\n", name, err, e->klass, e->message);
+				continue;
+			}
+
+			body_len = git_blob_rawsize(blob);
+			body = malloc(body_len);
+
+			memcpy(body, git_blob_rawcontent(blob), body_len);
+
+			git_blob_free(blob);
+			header = malloc(512);
+			snprintf(
+				header,
+				512,
+				"HTTP/1.1 200 OK\r\n"
+				"Content-Type: application/octet-stream\r\n"
+				"Content-Length: %zu\r\n"
+				"\r\n",
+				body_len
+			);
+
+			send(clientfd, header, strlen(header), 0);
+			send(clientfd, body, body_len, 0);
+			free(header);
+			free(body);
+			free(uri);
 			return;
 		}
 	}
 
-	char *notfound = "HTTP/1.1 404 Not Found\r\n"
-				  "Content-Length: 0\r\n"
-				  "\r\n";
 
-	send(clientfd, notfound, strlen(notfound), 0);
+
+	// TODO: implement
+	/* Advanced: /.well-known/openpgpkey/example.com/hu/ */
+
+	not_found(clientfd);
+	free(uri);
 }
 
+/*
 void *handle_authget(int clientfd, char *cursor) {
 	printf("handling authget..\n");
 	return NULL;
@@ -174,124 +432,12 @@ void *handle_get(int clientfd, char *cursor) {
 
 		printf("%s\n", cursor);
 
-	git_repository *repo = state.repo;
-	git_oid oid;
-	git_commit *commit;
-	git_tree *tree = NULL;
-	git_tree_entry *entry = NULL;
-	int err;
+	// send(clientfd, header, strlen(header), 0);
+	// send(clientfd, body, body_len, 0);
 
-	err = git_reference_name_to_id(&oid, repo, "HEAD");
-	if (err < 0) {
-		const git_error *e = git_error_last();
-		fprintf(stderr, "Couldn't get HEAD reference %d/%d: %s\n", err, e->klass, e->message);
-		return NULL;
-	}
-
-	err = git_commit_lookup(&commit, repo, &oid);
-	if (err < 0) {
-		const git_error *e = git_error_last();
-		fprintf(stderr, "Couldn't look up object id in git database %d/%d: %s\n", err, e->klass, e->message);
-		return NULL;
-	}
-
-	err = git_commit_tree(&tree, commit);
-	if (err < 0) {
-		const git_error *e = git_error_last();
-		fprintf(stderr, "Couldn't get tree for commit %d/%d: %s\n", err, e->klass, e->message);
-		return NULL;
-	}
-
-
-	err = git_tree_entry_bypath(&entry, tree, "keys");
-	if (err < 0) {
-		const git_error *e = git_error_last();
-		fprintf(stderr, "Couldn't get keys/ subdirectory %d/%d: %s\n", err, e->klass, e->message);
-		return NULL;
-	}
-
-	if (git_tree_entry_type(entry) != GIT_OBJECT_TREE) {
-		const git_error *e = git_error_last();
-		fprintf(stderr, "Expected a directory \"keys/\", not a file %d/%d: %s\n", err, e->klass, e->message);
-		return NULL;
-	}
-
-	git_tree *keys_tree = NULL;
-	err = git_tree_lookup(&keys_tree, repo, git_tree_entry_id(entry));
-	if (err < 0) {
-		const git_error *e = git_error_last();
-		fprintf(stderr, "Couldn't look-up keys tree %d/%d: %s\n", err, e->klass, e->message);
-		return NULL;
-	}
-
-	char *body = malloc(RESPONSE_SIZE);
-	char *body_cur = body;
-
-	int matches = 0;
-	for (size_t i = 0; i < git_tree_entrycount(keys_tree) && matches <= MAX_CERTS; i++) {
-		const git_tree_entry *e = git_tree_entry_byindex(keys_tree, i);
-
-		if (!e)
-			continue;
-
-		const char *name = git_tree_entry_name(e);
-		const git_oid *oid = git_tree_entry_id(e);
-
-		if (cursor[0] == '0' && cursor[1] == 'x')
-			cursor += 2;
-
-		size_t search_len = strchr(cursor, ' ') - cursor;
-
-		printf("name: %s\n", name);
-		printf("searh: %s\n", cursor);
-		if (strncmp(cursor, name, MIN(search_len, strlen(name))) == 0) {
-			matches++;
-			printf("Matches! %s\n", name);
-
-			git_blob *blob;
-			err = git_blob_lookup(&blob, repo, oid);
-			if (err < 0) {
-				const git_error *e = git_error_last();
-				fprintf(stderr, "Couldn't read blob %s %d/%d: %s\n", name, err, e->klass, e->message);
-				return NULL;
-			}
-
-			size_t blob_size = git_blob_rawsize(blob);
-			memcpy(body_cur, git_blob_rawcontent(blob), blob_size);
-			body_cur += blob_size;
-
-			git_blob_free(blob);
-		}
-
-	}
-
-	if (body_cur == RESPONSE_SIZE - 1) {
-		*body_cur = '\0';
-	} else {
-		body_cur++;
-		*body_cur = '\0';
-	}
-
-	size_t body_len = body_cur - body;
-	char *header = malloc(512);
-	snprintf(header, 512, "HTTP/1.1 200 OK\r\n"
-                          "Content-Type: application/pgp-keys\r\n"
-                          "Content-Length: %zu\r\n"
-		                  "\r\n", body_len);
-
-	send(clientfd, header, strlen(header), 0);
-	send(clientfd, body, body_len, 0);
-
-	free(header);
-	free(body);
-
-	git_tree_free(keys_tree);
-	git_tree_free(tree);
-	git_commit_free(commit);
-	git_tree_entry_free(entry);
 	return NULL;
 }
-/*
+
 void *handle_prefixlog(int clientfd, char *cursor) {
 	printf("handling prefixlog..\n");
 	return NULL;

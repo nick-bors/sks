@@ -8,7 +8,7 @@ OBJ=$(SRC:.c=.o)
 
 CONFIG_FILES=$(wildcard *.glsl) $(wildcard *.conf)
 
-NAME=sws
+NAME=sks
 
 PREFIX ?= /usr
 MANDIR ?= $(PREFIX)/man
