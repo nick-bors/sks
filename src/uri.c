@@ -1,10 +1,42 @@
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "uri.h"
 
 int hex_to_int(char);
 int percent_decode(char *);
+
+int hex_to_int(char c) {
+	if ('0' <= c && c <= '9') return c - '0';
+    if ('a' <= c && c <= 'f') return c - 'a' + 10;
+    if ('A' <= c && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+int percent_decode(char* src) {
+	char *dst = src;
+
+	while (*src) {
+		if (*src == '%') {
+			int hi = hex_to_int(src[1]);
+			int lo = hex_to_int(src[2]);
+
+			if (hi < 0 || lo < 0)
+				return -1;
+			
+			*src = (hi << 4) | lo;
+			*dst++ = *src;
+			src += 3;
+		} else {
+			*dst++ = *src++;
+		}
+	}
+
+	*dst = '\0';
+
+	return 0;
+}
 
 int parse_uri(Uri *out, char *uri) {
 	if(!out)
@@ -49,33 +81,22 @@ int parse_uri(Uri *out, char *uri) {
 	return 0;
 }
 
-int hex_to_int(char c) {
-	if ('0' <= c && c <= '9') return c - '0';
-    if ('a' <= c && c <= 'f') return c - 'a' + 10;
-    if ('A' <= c && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
+int skip_wellknown(const char *resource, const char *domain) {
+    static const char prefix[]   = "/.well-known/openpgpkey/";
+	static const int  prefix_len = sizeof(prefix) - 1;
 
-int percent_decode(char* src) {
-	char *dst = src;
+	/* Simple:   /.well-known/openpgpkey/ */
+	if (strncmp(resource, prefix, prefix_len) != 0)
+		return -1;
 
-	while (*src) {
-		if (*src == '%') {
-			int hi = hex_to_int(src[1]);
-			int lo = hex_to_int(src[2]);
+    const char *post = resource + prefix_len;
+	size_t domain_len = strlen(domain);
 
-			if (hi < 0 || lo < 0)
-				return -1;
-			
-			*src = (hi << 4) | lo;
-			*dst++ = *src;
-			src += 3;
-		} else {
-			*dst++ = *src++;
-		}
+	/* Advanced:   /.well-known/openpgpkey/domain.tld/ */
+	if (strncmp(domain, post, strlen(domain)) == 0
+		&& post[domain_len] == '/') {
+		post += domain_len + 1;	
 	}
 
-	*dst = '\0';
-
-	return 0;
+	return post - resource;
 }

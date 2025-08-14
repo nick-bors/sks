@@ -1,26 +1,40 @@
-#include <git2/repository.h>
-#include <git2/tree.h>
-#include <git2/types.h>
+/* See LICENSE file for copyright and license details.
+ *
+ * simple key server (SKS) is designed to follow WKS and WKD specifications
+ * (specifically, this ID draft-koch-openpgp-webkey-service-20). Unlike other
+ * popular servers, SKS does not provide transport layer security (TLS) and
+ * instead is designed to be used with a reverse proxy such as nginx, traefik
+ * etc. This decision allows SKS to focus on simplicity, handling only the
+ * storing, distributing, and submitting of OpenPGP keys.
+ */
+#include <errno.h>
+#include <getopt.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
 #include <strings.h>
 #include <unistd.h>
-#include <errno.h>
-#include <stdarg.h>
-#include <stdatomic.h>
 
-#include <sys/socket.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
 
 #include <git2.h>
+#include <git2/repository.h>
+#include <git2/tree.h>
+#include <git2/types.h>
 
+#include "arg.h"
 #include "uri.h"
+#include "util.h"
 #include "zbase32.h"
+#include "sock.h"
 
+/* macros */
 #define BUFFER_SIZE 1024
 #define MAX_CERTS 10
 
@@ -29,20 +43,22 @@
 #define GET_REQUEST_SIZE  (1 << 10) // 1kb.  Should be enough on GET for all clients.
 #define RESPONSE_SIZE     (1 << 15) // 32kb. Enough for ~6 large RSA keys or ~12 small ECC keys.
 
-#define LEN(x)    (sizeof(x)/sizeof((x)[0]))
-#define MIN(a,b)  ((a) < (b) ? (a) : (b))
+typedef struct {
+	git_repository *repo;
+} State;
 
-void  die(const char *, ...);
-void *handle(void *);
-void  get(int, char *);
-int   main(int, char *[]);
+/* function declarations */
 
-int skip_wellknown(const char *, const char *);
+static void  usage(void);
+static void *handle(void *);
+static void  get(int, char *);
+static void  handle_hashed_user(int, Uri *, int);
+static void  handle_policy(int);
+static void  handle_submission_address(int, const char *);
 
-void handle_hashed_user(int, Uri *, int);
-void handle_submission_address(int, const char *);
-void handle_policy(int);
+int main(int, char *[]);
 
+/*
 void *handle_authget   (int, char *);
 void *handle_get       (int, char *);
 void *handle_prefixlog (int, char *);
@@ -52,6 +68,12 @@ void *handle_hget      (int, char *);
 void *handle_index     (int, char *);
 void *handle_vindex    (int, char *);
 void *handle_stats     (int, char *);
+*/
+
+
+/* variables */
+char *argv0;
+static State state;
 
 /*
 static struct {
@@ -69,59 +91,58 @@ static struct {
 };
 */
 
-
-typedef struct {
-	git_repository *repo;
-} State;
-
-static State state;
-
-int main(int argc, char *argv[])
+void
+usage(void)
 {
+	die("Usage: %s [OPTIONS]\n"
+	    "Options:\n"
+            "  -p PORT_NUM   Port number to listen on (default: 443)\n"
+            "  -h HOSTNAME   Host/IP address to bind to\n"
+            "  -k KEYSDIR    Location of the keys git repository.\n"
+            "                (default: /var/lib/sks/keys.git)\n",
+	    argv0);
+}
+
+/* function implementations */
+int
+main(int argc, char *argv[])
+{
+	int cfd, sfd;
+	char *port = "11371", *host = NULL;
+	char *repo = "/var/lib/sks/keys.git/";
+
+	ARGBEGIN {
+	case 'p':
+		port = EARGF(usage());
+		break;
+	case 'h':
+		port = EARGF(usage());
+		break;
+	case 'k':
+		repo = EARGF(usage());
+		break;
+	default:
+		usage();
+	} ARGEND
+
+	sfd = get_in_sock(host, port);
+
 	git_libgit2_init();
 
-	int error = git_repository_open_bare(&state.repo, "./test.git");
-	if (error < 0) {
+	if (git_repository_open_bare(&state.repo, repo) < 0) {
 		const git_error *e = git_error_last();
-		die("Error %d/%d: %s", error, e->klass, e->message);
+		die("git_repository_open_bare: %d %s", e->klass, e->message);
 	}
 
-	if(argc < 2)
-		die("more args");
-
-	int16_t port;
-
-	if((port = atoi(argv[1])) <= 0)
-		die("couldn't string %s into a port no", argv[1]);
-
-	port = htons(port);
-
-	int sfd;
-	if ((sfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
-		die("unable to create socket");
-
-	struct sockaddr_in addr = {
-		.sin_family = AF_INET,
-		.sin_addr.s_addr = INADDR_ANY,
-		.sin_port = port
-	};
-
-	if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-		die("unable to bind to socket");
-
-	if (listen(sfd, 10) < 0)
-		die("unable to listen on socket");
-
 	for (;;) {
-		struct sockaddr_in client;
-		int *clientfd = malloc(sizeof(int));
+		struct sockaddr client;
 		socklen_t client_len = sizeof(client);
 
-		if ((*clientfd = accept(sfd, (struct sockaddr *)&client, &client_len)) < 0)
+		if ((cfd = accept(sfd, &client, &client_len)) < 0)
 			continue;
 
 		pthread_t thread;
-		pthread_create(&thread, NULL, handle, clientfd);
+		pthread_create(&thread, NULL, handle, &cfd);
 		pthread_detach(thread);
 	}
 
@@ -148,7 +169,6 @@ void* handle(void *arg) {
 	}
 
 	close(clientfd);
-	free(arg);
 	free(buffer);
 	return NULL;
 }
@@ -175,25 +195,6 @@ void not_found(int clientfd) {
 				  "\r\n";
 
 	send(clientfd, reply, strlen(reply), 0);
-}
-
-int skip_wellknown(const char *resource, const char *domain) {
-    static const char prefix[]   = "/.well-known/openpgpkey/";
-	static const int  prefix_len = sizeof(prefix) - 1;
-
-	/* Simple:   /.well-known/openpgpkey/ */
-	if (strncmp(resource, prefix, prefix_len) != 0)
-		return -1;
-
-    const char *post = resource + prefix_len;
-	size_t domain_len = strlen(domain);
-
-	if (strncasecmp(domain, post, strlen(domain)) == 0
-		&& post[domain_len] == '/') {
-		post += domain_len + 1;	
-	}
-
-	return post - resource;
 }
 
 void get(int clientfd, char *cursor) {
@@ -468,7 +469,7 @@ void *handle_stats(int clientfd, char *cursor) {
 }
 */
 
-
+/*
 void die(const char *fmt, ...)
 {
 	va_list ap;
@@ -486,3 +487,4 @@ void die(const char *fmt, ...)
 
 	exit(1);
 }
+*/

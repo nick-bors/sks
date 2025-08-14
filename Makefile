@@ -1,5 +1,6 @@
 CC=cc
-CFLAGS=-Wall -Wextra -pedantic -O3 -g3 -fsanitize=address
+CFLAGS=-Wall -Wextra -pedantic -O3 -g3 -fsanitize=address -std=c99 \
+       -D_XOPEN_SOURCE=700
 LDFLAGS=-lgit2 -fsanitize=address
 
 SRC=$(wildcard src/*.c)
@@ -18,7 +19,7 @@ DOC = \
 	  LICENSE \
 	  README.md
 MAN1 = \
-	   sws.1
+	   sks.1
 
 all: $(NAME)
 

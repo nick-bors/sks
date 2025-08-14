@@ -14,6 +14,7 @@ typedef struct {
 } Uri;
 
 int parse_uri(Uri *, char *);
+int skip_wellknown(const char *, const char *);
 
 void print_uri(Uri *u);
 
