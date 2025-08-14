@@ -8,8 +8,12 @@
  * storing, distributing, and submitting of OpenPGP keys.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
+#include <grp.h>
 #include <pthread.h>
+#include <pwd.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -44,11 +48,16 @@
 #define RESPONSE_SIZE     (1 << 15) // 32kb. Enough for ~6 large RSA keys or ~12 small ECC keys.
 
 typedef struct {
+	char *pidfile;
 	git_repository *repo;
 } State;
 
 /* function declarations */
 
+static void sig_cleanup(int);
+static void sig_reload(int);
+
+static void  handle_sigs(void);
 static void  usage(void);
 static void *handle(void *);
 static void  get(int, char *);
@@ -92,15 +101,70 @@ static struct {
 */
 
 void
+sig_cleanup(int sig)
+{
+	unlink(state.pidfile);
+
+	git_repository_free(state.repo);
+	git_libgit2_shutdown();
+
+	kill(0, sig);
+	_exit(1);
+}
+
+void
+sig_reload(int _sig)
+{
+	//TODO: invalidate cache/state
+	return;
+}
+
+void
+handle_sigs(void) {
+	struct sigaction cleanup = {
+		.sa_handler = sig_cleanup,
+	};
+
+	struct sigaction reload = {
+		.sa_handler = sig_reload,
+	};
+	
+	sigemptyset(&cleanup.sa_mask);
+	sigemptyset(&reload.sa_mask);
+
+	sigaction(SIGTERM, &cleanup, NULL);
+	sigaction(SIGHUP,  &reload,  NULL);
+	sigaction(SIGINT,  &cleanup, NULL);
+	sigaction(SIGQUIT, &cleanup, NULL);
+}
+
+void
 usage(void)
 {
 	die("Usage: %s [OPTIONS]\n"
 	    "Options:\n"
             "  -p PORT_NUM   Port number to listen on (default: 443)\n"
             "  -h HOSTNAME   Host/IP address to bind to\n"
+            "  -U USER       User or UID user to run as (default: 'sks')\n"
+            "  -G GROUP      Group or GID to run as (default: 'sks')\n"
+            "  -P PIDFILE    Location of the pidfile (default: '/run/sks.pid')\n"
             "  -k KEYSDIR    Location of the keys git repository.\n"
-            "                (default: /var/lib/sks/keys.git)\n",
+            "                (default: '/var/lib/sks/keys.git')\n",
 	    argv0);
+}
+
+void
+write_pidfile(void)
+{
+	int pidfd = open(state.pidfile, O_WRONLY | O_CREAT, 0644);
+
+	if (!pidfd)
+		die("Couldn't open pidfile:");
+
+	char buf[16];
+	snprintf(buf, 16, "%ld\n", (long)getpid());
+	if (write(pidfd, buf, strlen(buf)) < 0)
+		die("write:");
 }
 
 /* function implementations */
@@ -110,16 +174,51 @@ main(int argc, char *argv[])
 	int cfd, sfd;
 	char *port = "11371", *host = NULL;
 	char *repo = "/var/lib/sks/keys.git/";
+	char *group = "sks", *user = "sks";
+	struct passwd *pw = NULL;
+	struct group *gr = NULL;
+
+	state.pidfile = "/run/sks.pid";
+
+	git_libgit2_init();
+	handle_sigs();
 
 	ARGBEGIN {
 	case 'p':
 		port = EARGF(usage());
 		break;
 	case 'h':
-		port = EARGF(usage());
+		host = EARGF(usage());
 		break;
 	case 'k':
 		repo = EARGF(usage());
+		break;
+	case 'G':
+		group = EARGF(usage());
+
+		errno = 0;
+		if (!(gr = getgrnam(group))) {
+			if (errno) {
+				die("getgrnam '%s':", group);
+			} else {
+				die("Entry not found.");
+			}
+		}
+		break;
+	case 'U':
+		user = EARGF(usage());
+
+		errno = 0;
+		if (!(pw = getpwnam(user))) {
+			if (errno) {
+				die("getpwnam '%s':", user);
+			} else {
+				die("Entry not found.");
+			}
+		}
+		break;
+	case 'P':
+		state.pidfile = EARGF(usage());
 		break;
 	default:
 		usage();
@@ -127,7 +226,18 @@ main(int argc, char *argv[])
 
 	sfd = get_in_sock(host, port);
 
-	git_libgit2_init();
+	if (!gr)
+		die("No group set");
+	if (!pw)
+		die("No user set");
+
+	if (setgid(gr->gr_gid) || setuid(pw->pw_uid)) {
+	    die("Dropping privileges:");
+	}
+
+	setpgid(0, 0);
+
+	write_pidfile();
 
 	if (git_repository_open_bare(&state.repo, repo) < 0) {
 		const git_error *e = git_error_last();
@@ -175,23 +285,23 @@ void* handle(void *arg) {
 
 void bad_request(int clientfd) {
 	static const char reply[] = "HTTP/1.1 400 Bad Request\r\n"
-							    "Content-Length: 0\r\n"
-							    "\r\n";
+	                            "Content-Length: 0\r\n"
+	                            "\r\n";
 
 	send(clientfd, reply, sizeof(reply) - 1, 0);
 }
 
 void internal_server_error(int clientfd) {
 	char *reply = "HTTP/1.1 500 Internal Server Error\r\n"
-				  "Content-Length: 0\r\n"
-				  "\r\n";
+	              "Content-Length: 0\r\n"
+	              "\r\n";
 
 	send(clientfd, reply, strlen(reply), 0);
 }
 
 void not_found(int clientfd) {
 	char *reply = "HTTP/1.1 404 Not Found\r\n"
-				  "Content-Length: 0\r\n"
+	              "Content-Length: 0\r\n"
 				  "\r\n";
 
 	send(clientfd, reply, strlen(reply), 0);
@@ -219,13 +329,13 @@ void get(int clientfd, char *cursor) {
 
 	const char *suffix = uri->resource + offset;
 
-    static const char hu_suffix[]   = "hu/";
+	static const char hu_suffix[]   = "hu/";
 	static const int  hu_suffix_len = sizeof(hu_suffix) - 1;
 
-    static const char policy_suffix[]   = "policy";
+	static const char policy_suffix[]   = "policy";
 	static const int  policy_suffix_len = sizeof(policy_suffix) - 1;
 
-    static const char sub_suffix[]   = "submission-address";
+	static const char sub_suffix[]   = "submission-address";
 	static const int  sub_suffix_len = sizeof(sub_suffix) - 1;
 
 	if (strncmp(suffix, hu_suffix, hu_suffix_len) == 0) {
@@ -289,15 +399,15 @@ void handle_submission_address(int clientfd, const char *domain) {
 
 void handle_hashed_user(int clientfd, Uri *uri, int offset) {
 	const char *hash = uri->resource + offset;
-	printf("hash is: %s\n", hash);
+
 	if (strlen(hash) != 32) {
-		printf("bad REQ, hashlen expected 32, got %zu\n", strlen(hash));
+		logerr("Expected hash length to be 32, got %zu", strlen(hash));
 		bad_request(clientfd);
 		return;
 	}
 
 	if(!is_zbase32_chars(hash)) {
-		printf("hash is not zbase32 alphabet\n");
+		logerr("Hash is not valid zbase32");
 		bad_request(clientfd);
 		return;
 	}
@@ -307,28 +417,21 @@ void handle_hashed_user(int clientfd, Uri *uri, int offset) {
 	git_commit *commit;
 	git_tree *tree = NULL;
 	git_tree_entry *tree_entry = NULL;
-	int err;
 
-	err = git_reference_name_to_id(&oid, repo, "HEAD");
-	if (err < 0) {
-		const git_error *e = git_error_last();
-		fprintf(stderr, "Couldn't get HEAD reference %d/%d: %s\n", err, e->klass, e->message);
+	if (git_reference_name_to_id(&oid, repo, "HEAD") < 0) {
+		logerr("Couldn't get HEAD reference:");
 		internal_server_error(clientfd);
 		return;
 	}
 
-	err = git_commit_lookup(&commit, repo, &oid);
-	if (err < 0) {
-		const git_error *e = git_error_last();
-		fprintf(stderr, "Couldn't look up object id in git database %d/%d: %s\n", err, e->klass, e->message);
+	if (git_commit_lookup(&commit, repo, &oid) < 0) {
+		logerr("Couldn't look up object id in git database:");
 		internal_server_error(clientfd);
 		return;
 	}
 
-	err = git_commit_tree(&tree, commit);
-	if (err < 0) {
-		const git_error *e = git_error_last();
-		fprintf(stderr, "Couldn't get tree for commit %d/%d: %s\n", err, e->klass, e->message);
+	if (git_commit_tree(&tree, commit) < 0) {
+		logerr("Couldn't get tree for commit:");
 		internal_server_error(clientfd);
 		return;
 	}
@@ -336,26 +439,21 @@ void handle_hashed_user(int clientfd, Uri *uri, int offset) {
 	// Split into directories by starting hash letter
 	char dirstr[2] = {hash[0], '\0'};
 
-	err = git_tree_entry_bypath(&tree_entry, tree, dirstr);
-	if (err < 0) {
-		const git_error *e = git_error_last();
-		fprintf(stderr, "Couldn't find \"%s/\" subdirectory %d/%d: %s\n", dirstr, err, e->klass, e->message);
+	if (git_tree_entry_bypath(&tree_entry, tree, dirstr) < 0) {
+		logerr("Couldn't find '%s/' subdirectory:", dirstr);
 		not_found(clientfd);
 		return;
 	}
 
 	if (git_tree_entry_type(tree_entry) != GIT_OBJECT_TREE) {
-		const git_error *e = git_error_last();
-		fprintf(stderr, "Expected a directory \"%s/\", not a file %d/%d: %s\n", dirstr, err, e->klass, e->message);
+		logerr("Expected a directory '%s/', not a file:", dirstr);
 		internal_server_error(clientfd);
 		return;
 	}
 
 	git_tree *dir = NULL;
-	err = git_tree_lookup(&dir, repo, git_tree_entry_id(tree_entry));
-	if (err < 0) {
-		const git_error *e = git_error_last();
-		fprintf(stderr, "Couldn't look-up \"%s/\"tree %d/%d: %s\n", dirstr, err, e->klass, e->message);
+	if (git_tree_lookup(&dir, repo, git_tree_entry_id(tree_entry)) < 0) {
+		logerr("Couldn't look-up '%s/' tree:", dirstr);
 		internal_server_error(clientfd);
 		return;
 	}
@@ -374,16 +472,13 @@ void handle_hashed_user(int clientfd, Uri *uri, int offset) {
 		const char *name = git_tree_entry_name(e);
 		const git_oid *oid = git_tree_entry_id(e);
 
-		printf("hash: %s\n", hash);
-		printf("curr: %s\n", name);
 		if (strncmp(hash, name, 32) == 0) {
-			printf("Matches! %s\n", name);
+			printf("Sending '%s'\n", name);
 
 			git_blob *blob;
-			err = git_blob_lookup(&blob, repo, oid);
-			if (err < 0) {
+			if (git_blob_lookup(&blob, repo, oid) < 0) {
 				const git_error *e = git_error_last();
-				fprintf(stderr, "Couldn't read blob %s %d/%d: %s\n", name, err, e->klass, e->message);
+				fprintf(stderr, "Couldn't read blob '%s' %d: %s\n", name, e->klass, e->message);
 				continue;
 			}
 
@@ -412,11 +507,6 @@ void handle_hashed_user(int clientfd, Uri *uri, int offset) {
 			return;
 		}
 	}
-
-
-
-	// TODO: implement
-	/* Advanced: /.well-known/openpgpkey/example.com/hu/ */
 
 	not_found(clientfd);
 	free(uri);

@@ -9,3 +9,4 @@
 #define LENGTH(X)               (sizeof (X) / sizeof (X)[0])
 
 void die(const char *fmt, ...);
+void logerr(const char *fmt, ...);

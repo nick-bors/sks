@@ -41,3 +41,29 @@ die(const char *fmt, ...)
 
 	exit(1);
 }
+
+void
+logerr(const char *fmt, ...)
+{
+	va_list ap;
+	int saved_errno;
+	const git_error *e;
+
+	saved_errno = errno;
+
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+
+	if (fmt[0] && fmt[strlen(fmt)-1] == ':') {
+		e = git_error_last();
+
+		if (e->klass != GIT_ERROR_NONE)
+			fprintf(stderr, " (%d) %s", e->klass, e->message);
+		else {
+			fprintf(stderr, " %s", strerror(saved_errno));
+		}
+	}
+
+	fputc('\n', stderr);
+}
