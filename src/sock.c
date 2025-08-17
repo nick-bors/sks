@@ -1,8 +1,12 @@
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
+#include <netdb.h>
+#include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
-#include <netdb.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "util.h"
@@ -65,5 +69,51 @@ get_in_sock(const char *host, const char* port)
 		die("listen:");
 	}
 	
+	return sfd;
+}
+
+int
+get_unix_sock(const char *name, uid_t uid, gid_t gid)
+{
+	struct sockaddr_un addr = {
+		.sun_family = AF_UNIX
+	};
+
+	int sfd = 0;
+	// File perms: RW-RW-RW-
+	int mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+	size_t name_len;
+	
+	if ((name_len = strlen(name)) > sizeof(addr.sun_path) - 1)
+		die("UNIX domain socket path truncated");
+
+	memcpy(addr.sun_path, name, name_len + 1);
+
+	if ((sfd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
+		die("socket:");
+	}
+
+	if (bind(sfd, (const struct sockaddr*)&addr, sizeof(addr)) < 0
+	   && close(sfd) < 0)
+		die("close:");
+
+	if (listen(sfd, SOCKET_MAX_CONNS) < 0) {
+		if (unlink(name) < 0)
+			die("unlink %s:", name);
+		die("listen:");
+	}
+
+	if (chmod(name, mode) < 0) {
+		if (unlink(name) < 0)
+			die("unlink %s:", name);
+		die("chmod '%s':", name);
+	}
+
+	if (chown(name, uid, gid) < 0) {
+		if (unlink(name) < 0)
+			die("unlink %s:", name);
+		die("chown '%s':", name);
+	}
+
 	return sfd;
 }

@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -49,6 +50,7 @@
 
 typedef struct {
 	char *pidfile;
+	char *lmtpsock;
 	git_repository *repo;
 } State;
 
@@ -59,7 +61,7 @@ static void sig_reload(int);
 
 static void  handle_sigs(void);
 static void  usage(void);
-static void *handle(void *);
+static void *handle_http(void *);
 static void  get(int, char *);
 static void  handle_hashed_user(int, Uri *, int);
 static void  handle_policy(int);
@@ -104,6 +106,7 @@ void
 sig_cleanup(int sig)
 {
 	unlink(state.pidfile);
+	unlink(state.lmtpsock);
 
 	git_repository_free(state.repo);
 	git_libgit2_shutdown();
@@ -143,11 +146,13 @@ usage(void)
 {
 	die("Usage: %s [OPTIONS]\n"
 	    "Options:\n"
-            "  -p PORT_NUM   Port number to listen on (default: 443)\n"
-            "  -h HOSTNAME   Host/IP address to bind to\n"
+            "  -p PORT_NUM   Port number to listen on (default: 11371)\n"
+            "  -h HOSTNAME   Host/IP address to bind to (default: 0.0.0.0)\n"
             "  -U USER       User or UID user to run as (default: 'sks')\n"
             "  -G GROUP      Group or GID to run as (default: 'sks')\n"
-            "  -P PIDFILE    Location of the pidfile (default: '/run/sks.pid')\n"
+	    "  -P PIDFILE    Location of the pidfile (default: '/run/sks/sks.pid')\n"
+	    "  -L LMTPSOCK   Location of the LMTP socket to recieve mail on\n"
+	    "                (default: '/run/sks/sks.sock')\n"
             "  -k KEYSDIR    Location of the keys git repository.\n"
             "                (default: '/var/lib/sks/keys.git')\n",
 	    argv0);
@@ -171,16 +176,20 @@ write_pidfile(void)
 int
 main(int argc, char *argv[])
 {
-	int cfd, sfd;
-	char *port = "11371", *host = NULL;
+	int cfd, httpfd, lmtpfd;
+	char *port = "11371", *host = "0.0.0.0";
 	char *repo = "/var/lib/sks/keys.git/";
 	char *group = "sks", *user = "sks";
 	struct passwd *pw = NULL;
 	struct group *gr = NULL;
 
-	state.pidfile = "/run/sks.pid";
+	state.pidfile = NULL;
+	state.lmtpsock = NULL;
+
+	int mode = S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;
 
 	git_libgit2_init();
+
 	handle_sigs();
 
 	ARGBEGIN {
@@ -220,16 +229,28 @@ main(int argc, char *argv[])
 	case 'P':
 		state.pidfile = EARGF(usage());
 		break;
+	case 'L':
+		state.lmtpsock = EARGF(usage());
+		break;
 	default:
 		usage();
 	} ARGEND
 
-	sfd = get_in_sock(host, port);
+	if (!state.pidfile || !state.lmtpsock) {
+		if (mkdir("/run/sks", mode) < 0 && errno != EEXIST)
+			die("mkdir '/run/sks/':");
+
+		state.pidfile = "/run/sks/sks.pid";
+		state.lmtpsock = "/run/sks/sks.sock";
+	}
 
 	if (!gr)
 		die("No group set");
 	if (!pw)
 		die("No user set");
+
+	httpfd = get_in_sock(host, port);
+	lmtpfd = get_unix_sock(state.lmtpsock, pw->pw_uid, gr->gr_gid);
 
 	if (setgid(gr->gr_gid) || setuid(pw->pw_uid)) {
 	    die("Dropping privileges:");
@@ -248,11 +269,11 @@ main(int argc, char *argv[])
 		struct sockaddr client;
 		socklen_t client_len = sizeof(client);
 
-		if ((cfd = accept(sfd, &client, &client_len)) < 0)
+		if ((cfd = accept(httpfd , &client, &client_len)) < 0)
 			continue;
 
 		pthread_t thread;
-		pthread_create(&thread, NULL, handle, &cfd);
+		pthread_create(&thread, NULL, handle_http, &cfd);
 		pthread_detach(thread);
 	}
 
@@ -261,7 +282,7 @@ main(int argc, char *argv[])
 	return EXIT_SUCCESS;
 }
 
-void* handle(void *arg) {
+void* handle_http(void *arg) {
 	int clientfd = *(int *)arg;
 	char *buffer = malloc(BUFFER_SIZE);
 
@@ -292,17 +313,17 @@ void bad_request(int clientfd) {
 }
 
 void internal_server_error(int clientfd) {
-	char *reply = "HTTP/1.1 500 Internal Server Error\r\n"
-	              "Content-Length: 0\r\n"
-	              "\r\n";
+	static const  char *reply = "HTTP/1.1 500 Internal Server Error\r\n"
+	                            "Content-Length: 0\r\n"
+	                            "\r\n";
 
 	send(clientfd, reply, strlen(reply), 0);
 }
 
 void not_found(int clientfd) {
-	char *reply = "HTTP/1.1 404 Not Found\r\n"
-	              "Content-Length: 0\r\n"
-				  "\r\n";
+	static const char *reply = "HTTP/1.1 404 Not Found\r\n"
+	                           "Content-Length: 0\r\n"
+				   "\r\n";
 
 	send(clientfd, reply, strlen(reply), 0);
 }
