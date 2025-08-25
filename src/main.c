@@ -34,10 +34,12 @@
 #include <git2/types.h>
 
 #include "arg.h"
+#include "queue.h"
+#include "sock.h"
+#include "src/queue.h"
 #include "uri.h"
 #include "util.h"
 #include "zbase32.h"
-#include "sock.h"
 
 /* macros */
 #define BUFFER_SIZE 1024
@@ -52,6 +54,7 @@ typedef struct {
 	char *pidfile;
 	char *lmtpsock;
 	git_repository *repo;
+	Pool *pool;
 } State;
 
 /* function declarations */
@@ -59,13 +62,13 @@ typedef struct {
 static void sig_cleanup(int);
 static void sig_reload(int);
 
-static void  handle_sigs(void);
-static void  usage(void);
-static void *handle_http(void *);
-static void  get(int, char *);
-static void  handle_hashed_user(int, Uri *, int);
-static void  handle_policy(int);
-static void  handle_submission_address(int, const char *);
+static void handle_sigs(void);
+static void usage(void);
+static void handle_http(void *);
+static void get(int, char *);
+static void handle_hashed_user(int, Uri *, int);
+static void handle_policy(int);
+static void handle_submission_address(int, const char *);
 
 int main(int, char *[]);
 
@@ -105,6 +108,8 @@ static struct {
 void
 sig_cleanup(int sig)
 {
+	pool_destroy(state.pool);
+
 	unlink(state.pidfile);
 	unlink(state.lmtpsock);
 
@@ -116,8 +121,9 @@ sig_cleanup(int sig)
 }
 
 void
-sig_reload(int _sig)
+sig_reload(int sig)
 {
+	UNUSED(sig);
 	//TODO: invalidate cache/state
 	return;
 }
@@ -177,12 +183,12 @@ int
 main(int argc, char *argv[])
 {
 	int cfd, httpfd, lmtpfd;
+	size_t nthreads;
 	char *port = "11371", *host = "0.0.0.0";
 	char *repo = "/var/lib/sks/keys.git/";
-	char *group = "sks", *user = "sks";
+	char *group = "sks", *user = "sks", *end;
 	struct passwd *pw = NULL;
 	struct group *gr = NULL;
-
 	state.pidfile = NULL;
 	state.lmtpsock = NULL;
 
@@ -191,6 +197,10 @@ main(int argc, char *argv[])
 	git_libgit2_init();
 
 	handle_sigs();
+
+	nthreads = sysconf(_SC_NPROCESSORS_ONLN);
+	if (nthreads < 1)
+		nthreads = 1;
 
 	ARGBEGIN {
 	case 'p':
@@ -232,6 +242,14 @@ main(int argc, char *argv[])
 	case 'L':
 		state.lmtpsock = EARGF(usage());
 		break;
+	case 't':
+		errno = 0;
+		nthreads = strtoul(EARGF(usage()), &end, 10);
+
+		if (errno == ERANGE || !end || *end != '\0') {
+			usage();
+		}
+		break;
 	default:
 		usage();
 	} ARGEND
@@ -265,6 +283,8 @@ main(int argc, char *argv[])
 		die("git_repository_open_bare: %d %s", e->klass, e->message);
 	}
 
+	state.pool = pool_create(nthreads);
+
 	for (;;) {
 		struct sockaddr client;
 		socklen_t client_len = sizeof(client);
@@ -272,18 +292,21 @@ main(int argc, char *argv[])
 		if ((cfd = accept(httpfd , &client, &client_len)) < 0)
 			continue;
 
-		pthread_t thread;
-		pthread_create(&thread, NULL, handle_http, &cfd);
-		pthread_detach(thread);
+		pool_job(state.pool, handle_http, (void *)&cfd);
 	}
 
 	git_repository_free(state.repo);
 	git_libgit2_shutdown();
+	pool_destroy(state.pool);
 	return EXIT_SUCCESS;
 }
 
-void* handle_http(void *arg) {
+void
+handle_http(void *arg)
+{
 	int clientfd = *(int *)arg;
+
+	printf("Handling http request...\n");
 	char *buffer = malloc(BUFFER_SIZE);
 
 	ssize_t bytes = recv(clientfd, buffer, BUFFER_SIZE - 1, 0);
@@ -301,7 +324,6 @@ void* handle_http(void *arg) {
 
 	close(clientfd);
 	free(buffer);
-	return NULL;
 }
 
 void bad_request(int clientfd) {
