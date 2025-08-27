@@ -9,9 +9,9 @@ int percent_decode(char *);
 
 int hex_to_int(char c) {
 	if ('0' <= c && c <= '9') return c - '0';
-    if ('a' <= c && c <= 'f') return c - 'a' + 10;
-    if ('A' <= c && c <= 'F') return c - 'A' + 10;
-    return -1;
+	if ('a' <= c && c <= 'f') return c - 'a' + 10;
+	if ('A' <= c && c <= 'F') return c - 'A' + 10;
+	return -1;
 }
 
 int percent_decode(char* src) {
@@ -82,14 +82,14 @@ int parse_uri(Uri *out, char *uri) {
 }
 
 int skip_wellknown(const char *resource, const char *domain) {
-    static const char prefix[]   = "/.well-known/openpgpkey/";
+	static const char prefix[]   = "/.well-known/openpgpkey/";
 	static const int  prefix_len = sizeof(prefix) - 1;
 
 	/* Simple:   /.well-known/openpgpkey/ */
 	if (strncmp(resource, prefix, prefix_len) != 0)
 		return -1;
 
-    const char *post = resource + prefix_len;
+	const char *post = resource + prefix_len;
 	size_t domain_len = strlen(domain);
 
 	/* Advanced:   /.well-known/openpgpkey/domain.tld/ */
