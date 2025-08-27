@@ -1,0 +1,7 @@
+#!/sbin/openrc-run
+
+command="/usr/bin/sks"
+
+# The special RC_SVCNAME variable contains the name of this service.
+pidfile="/run/${RC_SVCNAME}.pid"
+command_args="-P ${pidfile}"

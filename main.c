@@ -36,7 +36,7 @@
 #include "arg.h"
 #include "queue.h"
 #include "sock.h"
-#include "src/queue.h"
+#include "queue.h"
 #include "uri.h"
 #include "util.h"
 #include "zbase32.h"
@@ -50,6 +50,12 @@
 #define GET_REQUEST_SIZE  (1 << 10) // 1kb.  Should be enough on GET for all clients.
 #define RESPONSE_SIZE     (1 << 15) // 32kb. Enough for ~6 large RSA keys or ~12 small ECC keys.
 
+#define GET(s, fn, wk)  { "GET",  (s), sizeof((s)) - 1, (fn), wk }
+#define HEAD(s, fn, wk) { "HEAD", (s), sizeof((s)) - 1, (fn), wk }
+
+/* enums */
+enum { METHOD_GET, METHOD_HEAD };
+
 typedef struct {
 	char *pidfile;
 	char *lmtpsock;
@@ -57,21 +63,27 @@ typedef struct {
 	Pool *pool;
 } State;
 
-/* function declarations */
+typedef struct {
+	const char *method;
+	const char *path;
+	size_t path_len;
+	void (*handler)(int, int, Uri *, void *);
+	int skip_wellknown;
+} Route;
 
+/* function declarations */
+static void bad_request(int clientfd);
+static void get(int, char *);
+static void handle_hashed_user(int, int, Uri *, void *);
+static void handle_http(void *);
+static void handle_policy(int, int, Uri *, void *);
+static void handle_sigs(void);
+static void handle_submission_address(int, int, Uri *, void *);
+static void internal_server_error(int clientfd);
+static void not_found(int clientfd);
 static void sig_cleanup(int);
 static void sig_reload(int);
-
-static void handle_sigs(void);
 static void usage(void);
-static void handle_http(void *);
-static void get(int, char *);
-static void handle_hashed_user(int, Uri *, int);
-static void handle_policy(int);
-static void handle_submission_address(int, const char *);
-
-int main(int, char *[]);
-
 /*
 void *handle_authget   (int, char *);
 void *handle_get       (int, char *);
@@ -89,21 +101,13 @@ void *handle_stats     (int, char *);
 char *argv0;
 static State state;
 
-/*
-static struct {
-	const char *op; void* (*handler)(int, char *);
-} Handlers[] = {
-	// {"authget", handle_authget},
-	{"get", handle_get},
-	// {"prefixlog", handle_prefixlog},
-	// {"vfpget", handle_vfpget},
-	// {"kidget", handle_kidget},
-	// {"hget", handle_hget},
-	// {"index", handle_index},
-	// {"vindex", handle_vindex},
-	// {"stats", handle_stats},
+static Route routes[] = {
+/*	Method Path                 Handler       skip wellknown */
+	HEAD( "hu/",                handle_hashed_user,        1 ),
+	 GET( "hu/",                handle_hashed_user,        1 ),
+	 GET( "policy",             handle_policy,             1 ),
+	 GET( "submission-address", handle_submission_address, 1 ),
 };
-*/
 
 void
 sig_cleanup(int sig)
@@ -129,7 +133,8 @@ sig_reload(int sig)
 }
 
 void
-handle_sigs(void) {
+handle_sigs(void)
+{
 	struct sigaction cleanup = {
 		.sa_handler = sig_cleanup,
 	};
@@ -179,6 +184,383 @@ write_pidfile(void)
 }
 
 /* function implementations */
+void
+handle_http(void *arg)
+{
+	size_t i;
+	Uri *uri;
+	int clientfd = *(int *)arg;
+ 	
+	uri = malloc(sizeof(Uri));
+
+	printf("Handling http request...\n");
+	char *buffer = malloc(BUFFER_SIZE);
+
+	ssize_t bytes = recv(clientfd, buffer, BUFFER_SIZE - 1, 0);
+
+	if (bytes > 0) {
+		int method;
+
+		buffer[bytes] = '\0';
+		
+		if (strncmp(buffer, "GET ", 4) == 0) {
+			buffer += 4;
+			method = METHOD_GET;
+		} else if (strncmp(buffer, "HEAD ", 5) == 0) {
+			buffer += 5;
+			method = METHOD_HEAD;
+		} else {
+			goto cleanup;
+		}
+
+		for (i = 0; i < LEN(routes); i++) {
+			char *cursor = buffer;
+			Route *r = &routes[i];
+       			char *rawuri = buffer;
+
+		        if (!(cursor = strchr(buffer, ' ')))
+       				goto cleanup;			
+
+			*cursor++ = '\0';
+
+			Uri uri;
+			int offset = 0;
+			// RESTRUCTURE THIS
+			int e = parse_uri(&uri, rawuri);
+			if (e < 0)
+				goto cleanup;
+			
+			if (r->skip_wellknown)
+				offset = skip_wellknown(uri.resource, "example.com");
+
+			if (strncmp(uri.resource + offset, r->path, r->path_len) == 0) {
+				if (offset < 0) {
+					bad_request(clientfd);
+					goto cleanup;
+				}
+
+				r->handler(method, clientfd, &uri, (void *)&offset);
+			}
+		}
+
+	}
+
+cleanup:
+	close(clientfd);
+	free(buffer);
+}
+
+void
+bad_request(int clientfd)
+{
+	static const char reply[] = "HTTP/1.1 400 Bad Request\r\n"
+	                            "Content-Length: 0\r\n"
+	                            "\r\n";
+
+	send(clientfd, reply, sizeof(reply) - 1, 0);
+}
+
+void
+internal_server_error(int clientfd)
+{
+	static const  char *reply = "HTTP/1.1 500 Internal Server Error\r\n"
+	                            "Content-Length: 0\r\n"
+	                            "\r\n";
+
+	send(clientfd, reply, strlen(reply), 0);
+}
+
+void
+not_found(int clientfd)
+{
+	static const char *reply = "HTTP/1.1 404 Not Found\r\n"
+	                           "Content-Length: 0\r\n"
+				   "\r\n";
+
+	send(clientfd, reply, strlen(reply), 0);
+}
+
+/*
+void
+get(int clientfd, char *cursor)
+{
+	char *rawuri = cursor;
+	cursor = strchr(cursor, ' ');
+	*cursor++ = '\0';
+
+	Uri *uri = malloc(sizeof(Uri));
+	int e = parse_uri(uri, rawuri);
+	if (e < 0) {
+		bad_request(clientfd);
+		return;
+	}
+
+	const char *domain = "example.com";
+
+	int offset = skip_wellknown(uri->resource, domain);
+	if (offset < 0) {
+		bad_request(clientfd);
+		return;
+	}
+
+	const char *suffix = uri->resource + offset;
+
+	static const char hu_suffix[]   = "hu/";
+	static const int  hu_suffix_len = sizeof(hu_suffix) - 1;
+
+	static const char policy_suffix[]   = "policy";
+	static const int  policy_suffix_len = sizeof(policy_suffix) - 1;
+
+	static const char sub_suffix[]   = "submission-address";
+	static const int  sub_suffix_len = sizeof(sub_suffix) - 1;
+
+	if (strncmp(suffix, hu_suffix, hu_suffix_len) == 0) {
+		handle_hashed_user(clientfd, uri, offset + hu_suffix_len);
+		return;
+	}
+
+	if (strncmp(suffix, policy_suffix, policy_suffix_len) == 0) {
+		handle_policy(clientfd);
+		return;
+	}
+
+	if (strncmp(suffix, sub_suffix, sub_suffix_len) == 0) {
+		handle_submission_address(clientfd, domain);
+		return;
+	}
+
+	not_found(clientfd);
+	return;
+}
+*/
+
+void
+handle_policy(int method, int clientfd, Uri *uri, void *data)
+{
+	UNUSED(method);
+	UNUSED(uri);
+	UNUSED(data);
+
+	char *reply = "HTTP/1.1 200 OK\r\n"
+				  "Content-Type: text/plain; charset=UTF-8\r\n"
+				  "Content-Length: 22\r\n"
+				  "\r\n"
+				  "protocol-version: 20\r\n";
+
+	send(clientfd, reply, strlen(reply), 0);
+}
+
+void
+handle_submission_address(int method, int clientfd, Uri *uri, void *data)
+{
+	UNUSED(method);
+	UNUSED(uri);
+	UNUSED(data);
+
+	char *domain = "example.com";
+
+	static const char local[] = "openpgpkey@";
+	char *body = malloc(strlen(domain) + sizeof(local));
+
+
+	memcpy(body, local, sizeof(local));
+	strcat(body, domain);
+
+	if(strlen(body) > 256) {
+		bad_request(clientfd);
+		return;
+	}
+	// fixed header = 108
+	// max email length 256 hence Content-Length = 3
+	// null = 1
+	// total: 112
+	char *head = malloc(128);
+	
+	sprintf(head,
+		"HTTP/1.1 200 OK\r\n"
+		"Content-Type: text/plain; charset=utf-8\r\n"
+		"Content-Length: %zu\r\n"
+		"Cache-Control: max-age=86400\r\n"
+		"\r\n",
+		strlen(body));
+
+	send(clientfd, head, strlen(head), 0);
+	send(clientfd, body, strlen(body), 0);
+}
+
+void
+handle_hashed_user(int method, int clientfd, Uri *uri, void *data)
+{
+	UNUSED(data);
+	// size_t offset = *(size_t *)data;
+	// const char *hash = uri->resource + offset;
+	const char *hash = uri->resource;
+
+	if (strlen(hash) != 32) {
+		logerr("Expected hash length to be 32, got %zu", strlen(hash));
+		bad_request(clientfd);
+		return;
+	}
+
+	if(!is_zbase32_chars(hash)) {
+		logerr("Hash is not valid zbase32");
+		bad_request(clientfd);
+		return;
+	}
+
+	git_repository *repo = state.repo;
+	git_oid oid;
+	git_commit *commit;
+	git_tree *tree = NULL;
+	git_tree_entry *tree_entry = NULL;
+
+	if (git_reference_name_to_id(&oid, repo, "HEAD") < 0) {
+		logerr("Couldn't get HEAD reference:");
+		internal_server_error(clientfd);
+		return;
+	}
+
+	if (git_commit_lookup(&commit, repo, &oid) < 0) {
+		logerr("Couldn't look up object id in git database:");
+		internal_server_error(clientfd);
+		return;
+	}
+
+	if (git_commit_tree(&tree, commit) < 0) {
+		logerr("Couldn't get tree for commit:");
+		internal_server_error(clientfd);
+		return;
+	}
+
+	// Split into directories by starting hash letter
+	char dirstr[2] = {hash[0], '\0'};
+
+	if (git_tree_entry_bypath(&tree_entry, tree, dirstr) < 0) {
+		logerr("Couldn't find '%s/' subdirectory:", dirstr);
+		not_found(clientfd);
+		return;
+	}
+
+	if (git_tree_entry_type(tree_entry) != GIT_OBJECT_TREE) {
+		logerr("Expected a directory '%s/', not a file:", dirstr);
+		internal_server_error(clientfd);
+		return;
+	}
+
+	git_tree *dir = NULL;
+	if (git_tree_lookup(&dir, repo, git_tree_entry_id(tree_entry)) < 0) {
+		logerr("Couldn't look-up '%s/' tree:", dirstr);
+		internal_server_error(clientfd);
+		return;
+	}
+
+
+	char *header;
+	char *body = NULL;
+	size_t body_len = 0;
+
+	for (size_t i = 0; i < git_tree_entrycount(dir); i++) {
+		const git_tree_entry *e = git_tree_entry_byindex(dir, i);
+
+		if (!e)
+			continue;
+
+		const char *name = git_tree_entry_name(e);
+		const git_oid *oid = git_tree_entry_id(e);
+
+		if (strncmp(hash, name, 32) != 0)
+			continue;
+
+		printf("Sending '%s'\n", name);
+
+		if (method == METHOD_GET) {
+			git_blob *blob;
+			if (git_blob_lookup(&blob, repo, oid) < 0) {
+				const git_error *e = git_error_last();
+				fprintf(stderr, "Couldn't read blob '%s' %d: %s\n", name, e->klass, e->message);
+				continue;
+			}
+
+			body_len = git_blob_rawsize(blob);
+			body = malloc(body_len);
+
+			memcpy(body, git_blob_rawcontent(blob), body_len);
+
+			git_blob_free(blob);
+		};
+
+		header = malloc(512);
+		snprintf(
+			header,
+			512,
+			"HTTP/1.1 200 OK\r\n"
+			"Content-Type: application/octet-stream\r\n"
+			"Content-Length: %zu\r\n"
+			"\r\n",
+			body_len
+		);
+
+		send(clientfd, header, strlen(header), 0);
+		free(header);
+
+		if (method == METHOD_GET) {
+			send(clientfd, body, body_len, 0);
+			free(body);
+		}
+
+		return;
+	}
+
+	not_found(clientfd);
+}
+
+/*
+void *handle_authget(int clientfd, char *cursor) {
+	printf("handling authget..\n");
+	return NULL;
+}
+
+void *handle_get(int clientfd, char *cursor) {
+	printf("handling get..\n");
+
+		printf("%s\n", cursor);
+
+	// send(clientfd, header, strlen(header), 0);
+	// send(clientfd, body, body_len, 0);
+
+	return NULL;
+}
+
+void *handle_prefixlog(int clientfd, char *cursor) {
+	printf("handling prefixlog..\n");
+	return NULL;
+}
+void *handle_vfpget(int clientfd, char *cursor) {
+	printf("handling vfpget..\n");
+	return NULL;
+}
+void *handle_kidget(int clientfd, char *cursor) {
+	printf("handling kidget..\n");
+	return NULL;
+}
+void *handle_hget(int clientfd, char *cursor) {
+	printf("handling hget..\n");
+	return NULL;
+}
+void *handle_index(int clientfd, char *cursor) {
+	printf("handling index..\n");
+	return NULL;
+}
+void *handle_vindex(int clientfd, char *cursor) {
+	printf("handling vindex..\n");
+	return NULL;
+}
+void *handle_stats(int clientfd, char *cursor) {
+	printf("handling stats..\n");
+	return NULL;
+}
+*/
+
 int
 main(int argc, char *argv[])
 {
@@ -301,323 +683,3 @@ main(int argc, char *argv[])
 	return EXIT_SUCCESS;
 }
 
-void
-handle_http(void *arg)
-{
-	int clientfd = *(int *)arg;
-
-	printf("Handling http request...\n");
-	char *buffer = malloc(BUFFER_SIZE);
-
-	ssize_t bytes = recv(clientfd, buffer, BUFFER_SIZE - 1, 0);
-
-	if (bytes > 0) {
-		buffer[bytes] = '\0';
-
-		if(strncmp(buffer, "GET ", 4) == 0) {
-			get(clientfd, buffer + 4);
-		} /* else if (strncmp(buffer, "POST ", 5) == 0) {
-
-		} */
-
-	}
-
-	close(clientfd);
-	free(buffer);
-}
-
-void bad_request(int clientfd) {
-	static const char reply[] = "HTTP/1.1 400 Bad Request\r\n"
-	                            "Content-Length: 0\r\n"
-	                            "\r\n";
-
-	send(clientfd, reply, sizeof(reply) - 1, 0);
-}
-
-void internal_server_error(int clientfd) {
-	static const  char *reply = "HTTP/1.1 500 Internal Server Error\r\n"
-	                            "Content-Length: 0\r\n"
-	                            "\r\n";
-
-	send(clientfd, reply, strlen(reply), 0);
-}
-
-void not_found(int clientfd) {
-	static const char *reply = "HTTP/1.1 404 Not Found\r\n"
-	                           "Content-Length: 0\r\n"
-				   "\r\n";
-
-	send(clientfd, reply, strlen(reply), 0);
-}
-
-void get(int clientfd, char *cursor) {
-	char *rawuri = cursor;
-	cursor = strchr(cursor, ' ');
-	*cursor++ = '\0';
-
-	Uri *uri = malloc(sizeof(Uri));
-	int e = parse_uri(uri, rawuri);
-	if (e < 0) {
-		bad_request(clientfd);
-		return;
-	}
-
-	const char *domain = "example.com";
-
-	int offset = skip_wellknown(uri->resource, domain);
-	if (offset < 0) {
-		bad_request(clientfd);
-		return;
-	}
-
-	const char *suffix = uri->resource + offset;
-
-	static const char hu_suffix[]   = "hu/";
-	static const int  hu_suffix_len = sizeof(hu_suffix) - 1;
-
-	static const char policy_suffix[]   = "policy";
-	static const int  policy_suffix_len = sizeof(policy_suffix) - 1;
-
-	static const char sub_suffix[]   = "submission-address";
-	static const int  sub_suffix_len = sizeof(sub_suffix) - 1;
-
-	if (strncmp(suffix, hu_suffix, hu_suffix_len) == 0) {
-		handle_hashed_user(clientfd, uri, offset + hu_suffix_len);
-		return;
-	}
-
-	if (strncmp(suffix, policy_suffix, policy_suffix_len) == 0) {
-		handle_policy(clientfd);
-		return;
-	}
-
-	if (strncmp(suffix, sub_suffix, sub_suffix_len) == 0) {
-		handle_submission_address(clientfd, domain);
-		return;
-	}
-
-	not_found(clientfd);
-	return;
-}
-
-void handle_policy(int clientfd) {
-	char *reply = "HTTP/1.1 200 OK\r\n"
-				  "Content-Type: text/plain; charset=UTF-8\r\n"
-				  "Content-Length: 22\r\n"
-				  "\r\n"
-				  "protocol-version: 20\r\n";
-
-	send(clientfd, reply, strlen(reply), 0);
-}
-
-void handle_submission_address(int clientfd, const char *domain) {
-	static const char local[] = "openpgpkey@";
-	char *body = malloc(strlen(domain) + sizeof(local));
-
-
-	memcpy(body, local, sizeof(local));
-	strcat(body, domain);
-
-	if(strlen(body) > 256) {
-		bad_request(clientfd);
-		return;
-	}
-	// fixed header = 108
-	// max email length 256 hence Content-Length = 3
-	// null = 1
-	// total: 112
-	char *head = malloc(112);
-	
-	sprintf(head,
-		"HTTP/1.1 200 OK\r\n"
-		"Content-Type: text/plain; charset=utf-8\r\n"
-		"Content-Length: %zu\r\n"
-		"Cache-Control: max-age=86400\r\n"
-		"\r\n",
-		strlen(body));
-
-	send(clientfd, head, strlen(head), 0);
-	send(clientfd, body, strlen(body), 0);
-}
-
-void handle_hashed_user(int clientfd, Uri *uri, int offset) {
-	const char *hash = uri->resource + offset;
-
-	if (strlen(hash) != 32) {
-		logerr("Expected hash length to be 32, got %zu", strlen(hash));
-		bad_request(clientfd);
-		return;
-	}
-
-	if(!is_zbase32_chars(hash)) {
-		logerr("Hash is not valid zbase32");
-		bad_request(clientfd);
-		return;
-	}
-
-	git_repository *repo = state.repo;
-	git_oid oid;
-	git_commit *commit;
-	git_tree *tree = NULL;
-	git_tree_entry *tree_entry = NULL;
-
-	if (git_reference_name_to_id(&oid, repo, "HEAD") < 0) {
-		logerr("Couldn't get HEAD reference:");
-		internal_server_error(clientfd);
-		return;
-	}
-
-	if (git_commit_lookup(&commit, repo, &oid) < 0) {
-		logerr("Couldn't look up object id in git database:");
-		internal_server_error(clientfd);
-		return;
-	}
-
-	if (git_commit_tree(&tree, commit) < 0) {
-		logerr("Couldn't get tree for commit:");
-		internal_server_error(clientfd);
-		return;
-	}
-
-	// Split into directories by starting hash letter
-	char dirstr[2] = {hash[0], '\0'};
-
-	if (git_tree_entry_bypath(&tree_entry, tree, dirstr) < 0) {
-		logerr("Couldn't find '%s/' subdirectory:", dirstr);
-		not_found(clientfd);
-		return;
-	}
-
-	if (git_tree_entry_type(tree_entry) != GIT_OBJECT_TREE) {
-		logerr("Expected a directory '%s/', not a file:", dirstr);
-		internal_server_error(clientfd);
-		return;
-	}
-
-	git_tree *dir = NULL;
-	if (git_tree_lookup(&dir, repo, git_tree_entry_id(tree_entry)) < 0) {
-		logerr("Couldn't look-up '%s/' tree:", dirstr);
-		internal_server_error(clientfd);
-		return;
-	}
-
-
-	char *header;
-	char *body;
-	size_t body_len = 0;
-
-	for (size_t i = 0; i < git_tree_entrycount(dir); i++) {
-		const git_tree_entry *e = git_tree_entry_byindex(dir, i);
-
-		if (!e)
-			continue;
-
-		const char *name = git_tree_entry_name(e);
-		const git_oid *oid = git_tree_entry_id(e);
-
-		if (strncmp(hash, name, 32) == 0) {
-			printf("Sending '%s'\n", name);
-
-			git_blob *blob;
-			if (git_blob_lookup(&blob, repo, oid) < 0) {
-				const git_error *e = git_error_last();
-				fprintf(stderr, "Couldn't read blob '%s' %d: %s\n", name, e->klass, e->message);
-				continue;
-			}
-
-			body_len = git_blob_rawsize(blob);
-			body = malloc(body_len);
-
-			memcpy(body, git_blob_rawcontent(blob), body_len);
-
-			git_blob_free(blob);
-			header = malloc(512);
-			snprintf(
-				header,
-				512,
-				"HTTP/1.1 200 OK\r\n"
-				"Content-Type: application/octet-stream\r\n"
-				"Content-Length: %zu\r\n"
-				"\r\n",
-				body_len
-			);
-
-			send(clientfd, header, strlen(header), 0);
-			send(clientfd, body, body_len, 0);
-			free(header);
-			free(body);
-			free(uri);
-			return;
-		}
-	}
-
-	not_found(clientfd);
-	free(uri);
-}
-
-/*
-void *handle_authget(int clientfd, char *cursor) {
-	printf("handling authget..\n");
-	return NULL;
-}
-
-void *handle_get(int clientfd, char *cursor) {
-	printf("handling get..\n");
-
-		printf("%s\n", cursor);
-
-	// send(clientfd, header, strlen(header), 0);
-	// send(clientfd, body, body_len, 0);
-
-	return NULL;
-}
-
-void *handle_prefixlog(int clientfd, char *cursor) {
-	printf("handling prefixlog..\n");
-	return NULL;
-}
-void *handle_vfpget(int clientfd, char *cursor) {
-	printf("handling vfpget..\n");
-	return NULL;
-}
-void *handle_kidget(int clientfd, char *cursor) {
-	printf("handling kidget..\n");
-	return NULL;
-}
-void *handle_hget(int clientfd, char *cursor) {
-	printf("handling hget..\n");
-	return NULL;
-}
-void *handle_index(int clientfd, char *cursor) {
-	printf("handling index..\n");
-	return NULL;
-}
-void *handle_vindex(int clientfd, char *cursor) {
-	printf("handling vindex..\n");
-	return NULL;
-}
-void *handle_stats(int clientfd, char *cursor) {
-	printf("handling stats..\n");
-	return NULL;
-}
-*/
-
-/*
-void die(const char *fmt, ...)
-{
-	va_list ap;
-	int saved_errno;
-
-	saved_errno = errno;
-
-	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
-	va_end(ap);
-
-	if (fmt[0] && fmt[strlen(fmt)-1] == ':')
-		fprintf(stderr, " %s", strerror(saved_errno));
-	fputc('\n', stderr);
-
-	exit(1);
-}
-*/

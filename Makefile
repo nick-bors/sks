@@ -1,66 +1,46 @@
-CC=cc
-CFLAGS=-Wall -Wextra -pedantic -O3 -g3 -fsanitize=address -std=c99 \
-       -D_XOPEN_SOURCE=700
-LDFLAGS=-lgit2 -fsanitize=address
+# See LICENSE file for copyright and license details
+# SKS - simple key server
+.POSIX:
 
-SRC=$(wildcard src/*.c)
-INCLUDES=-I.
-OBJ=$(SRC:.c=.o)
+include config.mk
 
-CONFIG_FILES=$(wildcard *.glsl) $(wildcard *.conf)
+COMPONENTS = queue sock uri util zbase32
 
-NAME=sks
+all: sks
 
-PREFIX ?= /usr
-MANDIR ?= $(PREFIX)/man
-DOCPREFIX ?= ${PREFIX}/share/doc/${NAME}
+main.o: main.c arg.h queue.h sock.h uri.h util.h zbase32.h config.mk
+queue.o: queue.c util.h queue.h config.mk
+sock.o: sock.c config.h sock.h util.h config.mk
+uri.o: uri.c config.h uri.h config.mk
+zbase32.o: zbase32.c zbase32.h config.mk
+util.o: util.c util.h config.mk
 
-DOC = \
-	  LICENSE \
-	  README.md
-MAN1 = \
-	   sks.1
 
-all: $(NAME)
+sks: config.h $(COMPONENTS:=.o) $(COMPONENTS:=.h) main.o config.mk
+	$(CC) -o $@ $(CPPFLAGS) $(CFLAGS) $(COMPONENTS:=.o) main.o $(LDFLAGS)
 
-$(NAME): $(OBJ)
-	$(CC) $(OBJ) -o $(NAME) $(LDFLAGS)
-
-%.o: %.c
-	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
-install: all
-	mkdir -p ${DESTDIR}${PREFIX}/bin
-	cp -f ${NAME} ${DESTDIR}${PREFIX}/bin
-	chmod 755 ${DESTDIR}${PREFIX}/bin/${NAME}
-	# installing example files.
-	mkdir -p ${DESTDIR}${DOCPREFIX}
-	cp -f \
-		vertex.glsl\
-		fragment.glsl\
-		LICENSE\
-		zooc.conf\
-		README.sh\
-		${DESTDIR}${DOCPREFIX}
-	# installing manual pages.
-	mkdir -p ${DESTDIR}${MANPREFIX}/man1
-	cp -f ${MAN1} ${DESTDIR}${MANPREFIX}/man1
-	for m in ${MAN1}; do chmod 644 ${DESTDIR}${MANPREFIX}/man1/$$m; done
-
-uninstall:
-	rm -f ${DESTDIR}${PREFIX}/bin/${NAME}
-	# removing example files.
-	rm -f \
-		${DESTDIR}${DOCPREFIX}/vertex.glsl\
-		${DESTDIR}${DOCPREFIX}/fragment.glsl\
-		${DESTDIR}${DOCPREFIX}/LICENSE\
-		${DESTDIR}${DOCPREFIX}/zooc.conf\
-		${DESTDIR}${DOCPREFIX}/README.sh\
-		-rmdir ${DESTDIR}${DOCPREFIX}
-	# removing manual pages.
-	for m in ${MAN1}; do rm -f ${DESTDIR}${MANPREFIX}/man1/$$m; done
+config.h:
+	cp config.def.h $@
 
 clean:
-	rm -f ${NAME} ${OBJ}
+	rm -f sks main.o $(COMPONENTS:=.o)
 
-.PHONY: all clean install uninstall
+dist:
+	rm -rf "sks-$(VERSION)"
+	mkdir -p "sks-$(VERSION)"
+	cp -R LICENSE Makefile arg.h config.def.h config.mk sks.1 \
+		$(COMPONENTS:=.c) $(COMPONENTS:=.h) main.c "sks-$(VERSION)"
+	tar -cf - "sks-$(VERSION)" | gzip -c > "sks-$(VERSION).tar.gz"
+	rm -rf "sks-$(VERSION)"
+
+install: all
+	mkdir -p "$(DESTDIR)$(PREFIX)/bin"
+	cp -f sks "$(DESTDIR)$(PREFIX)/bin"
+	chmod 755 "$(DESTDIR)$(PREFIX)/bin/sks"
+	mkdir -p "$(DESTDIR)$(MANPREFIX)/man1"
+	cp sks.1 "$(DESTDIR)$(MANPREFIX)/man1/sks.1"
+	chmod 644 "$(DESTDIR)$(MANPREFIX)/man1/sks.1"
+
+uninstall:
+	rm -f "$(DESTDIR)$(PREFIX)/bin/sks"
+	rm -f "$(DESTDIR)$(MANPREFIX)/man1/sks.1"

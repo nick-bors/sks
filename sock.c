@@ -10,8 +10,7 @@
 #include <unistd.h>
 
 #include "util.h"
-
-#define SOCKET_MAX_CONNS 10
+#include "config.h"
 
 int
 get_in_sock(const char *host, const char* port)
